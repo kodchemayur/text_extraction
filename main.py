@@ -1,27 +1,33 @@
-import chromadb
 import os
-from chromadb import EmbeddingFunction
-from unstructured.partition.pdf import partition_pdf
-from unstructured.chunking.title import chunk_by_title
-import ollama
-import pandas as pd 
-import shutil 
+from pathlib import Path
 import json
-from io import StringIO
 import re
 import time
 import base64
-from pathlib import Path
+import shutil
+import pandas as pd
 from typing import Dict, List, Tuple, Any
-import concurrent.futures
+from io import StringIO
+
+# OpenAI imports
+from openai import OpenAI
+import faiss
+import numpy as np
+from unstructured.partition.pdf import partition_pdf
+from unstructured.chunking.title import chunk_by_title
+import pdfplumber
+from PIL import Image
+import io
 
 # --- GLOBAL SETUP & CONSTANTS ---
-OLLAMA_CLIENT = ollama.Client() 
+# Initialize OpenAI client
+OPENAI_CLIENT = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
-# --- Model Selection - Optimized for Speed ---
-TEXT_LLM_MODEL = "llama3.1:8b"
-MULTIMODAL_MODEL = "llava"
-EMBEDDING_MODEL = "nomic-embed-text"
+# --- Model Selection - Optimized for OpenAI ---
+TEXT_LLM_MODEL = "gpt-4.1-mini"  # Fast and accurate
+# TEXT_LLM_MODEL = "gpt-4.1"  # More accurate but slower
+MULTIMODAL_MODEL = "gpt-4o"  # Vision model
+EMBEDDING_MODEL = "text-embedding-3-small"  # Fast and efficient
 
 # --- CCG2.0 Fields (58 Fields from Excel) ---
 CCG2_FIELDS_SCHEMA = {
@@ -125,33 +131,28 @@ def calculate_confidence(field_name, extracted_value):
         return min(1.0, base_score + 0.2)
     return base_score
 
-# --- Ollama Embedding Function ---
-class OllamaEmbeddingFunction(EmbeddingFunction):
-    def __init__(self, model_name="nomic-embed-text"):
-        super().__init__()
-        self.client = OLLAMA_CLIENT
-        self.model_name = model_name
+def get_openai_embedding(text: str) -> List[float]:
+    """Get embedding from OpenAI"""
+    try:
+        response = OPENAI_CLIENT.embeddings.create(
+            model=EMBEDDING_MODEL,
+            input=text,
+            encoding_format="float"
+        )
+        return response.data[0].embedding
+    except Exception as e:
+        print(f"⚠️ Embedding error: {e}")
+        return [0.0] * 1536  # text-embedding-3-small dimension
 
-    def __call__(self, texts):
-        embeddings = []
-        for text in texts:
-            try:
-                response = self.client.embeddings(model=self.model_name, prompt=text)
-                embeddings.append(response['embedding'])
-            except Exception:
-                embeddings.append([0.1] * 768)
-        return embeddings
-
-# --- Optimized Healthcare Contract Extractor ---
+# --- Optimized Healthcare Contract Extractor with FAISS ---
 class HealthcareContractExtractor:
     def __init__(self, file_path):
         self.file_path = file_path
         self.extracted_elements = [] 
         self.raw_data_store = {}     
-        self.collection_name = "healthcare_contract_db"
-        self.db_path = "./healthcare_contract_db"
         self.image_dir = "extracted_images"
-        self.embedding_function = OllamaEmbeddingFunction()
+        self.faiss_index = None
+        self.index_to_id = {}
         
         # Store all extracted images for scanned PDF fallback
         self.all_extracted_images = {}  # {page_number: [image_paths]}
@@ -164,37 +165,19 @@ class HealthcareContractExtractor:
             "multimodal_corrections": 0
         }
         
-        # Clean setup
-        if os.path.exists(self.image_dir):
-            shutil.rmtree(self.image_dir)
-        os.makedirs(self.image_dir, exist_ok=True)
+        # Clean setup for Databricks
+        # Use /tmp for temporary files in Databricks
+        self.temp_dir = "/tmp/contract_extraction"
+        self.image_dir = os.path.join(self.temp_dir, "extracted_images")
         
-        if os.path.exists(self.db_path):
-            shutil.rmtree(self.db_path)
-        os.makedirs(self.db_path, exist_ok=True)
+        # Clean previous runs
+        for dir_path in [self.temp_dir, self.image_dir]:
+            if os.path.exists(dir_path):
+                shutil.rmtree(dir_path)
+            os.makedirs(dir_path, exist_ok=True)
         
-        self.client = self.initialize_chromadb()
-        self.collection = self.client.get_or_create_collection(
-            name=self.collection_name,
-            embedding_function=self.embedding_function
-        )
-        print("✅ Vector database ready.")
+        print("✅ FAISS vector database ready.")
 
-    def initialize_chromadb(self):
-        """Initialize ChromaDB with cleanup"""
-        client = chromadb.PersistentClient(path=self.db_path)
-        
-        try:
-            collections = client.list_collections()
-            collection_names = [c.name for c in collections]
-            if self.collection_name in collection_names:
-                client.delete_collection(name=self.collection_name)
-                print(f"✅ Cleaned existing collection: {self.collection_name}")
-        except Exception:
-            pass
-
-        return client
-    
     def partition_and_chunk(self):
         """
         Stage 1: Extract text and images - optimized for scanned PDFs
@@ -271,14 +254,15 @@ class HealthcareContractExtractor:
         print(f"✅ Cataloged {total_images} images across {len(self.all_extracted_images)} pages")
     
     def store_all_content(self):
-        """Stage 2: Store all content in vector database"""
+        """Stage 2: Store all content in FAISS vector database"""
         if not hasattr(self, 'chunks') or not self.chunks:
             print("❌ No chunks to store.")
             return 0
             
+        print("--- Stage 2: Creating FAISS Index ---")
         raw_data_id_counter = 0
-        documents, metadatas, ids = [], [], []
-
+        documents = []
+        
         for chunk in self.chunks:
             raw_id = f"raw_data_{raw_data_id_counter}"
             
@@ -290,23 +274,71 @@ class HealthcareContractExtractor:
                 "page": page_num
             } 
             
-            documents.append(content_to_store) 
-            metadatas.append({
-                "page_number": page_num,
-                "raw_data_id": raw_id
-            })
-            ids.append(f"doc_{raw_data_id_counter}")
+            documents.append(content_to_store)
+            self.index_to_id[raw_data_id_counter] = raw_id
             raw_data_id_counter += 1
 
-        self.collection.add(documents=documents, metadatas=metadatas, ids=ids)
-        print(f"✅ Stored {len(documents)} chunks in vector database.")
+        # Create FAISS index
+        embeddings = []
+        for doc in documents:
+            embedding = get_openai_embedding(doc)
+            embeddings.append(embedding)
+        
+        embeddings_array = np.array(embeddings).astype('float32')
+        dimension = embeddings_array.shape[1]
+        
+        # Create FAISS index (IndexFlatL2 for accuracy, IndexIVFFlat for speed with large datasets)
+        if len(documents) > 1000:
+            # For large datasets, use IndexIVFFlat
+            nlist = 100  # number of clusters
+            quantizer = faiss.IndexFlatL2(dimension)
+            self.faiss_index = faiss.IndexIVFFlat(quantizer, dimension, nlist)
+            self.faiss_index.train(embeddings_array)
+            self.faiss_index.add(embeddings_array)
+            self.faiss_index.nprobe = 10  # number of clusters to visit
+        else:
+            # For smaller datasets, use simple IndexFlatL2
+            self.faiss_index = faiss.IndexFlatL2(dimension)
+            self.faiss_index.add(embeddings_array)
+        
+        print(f"✅ Stored {len(documents)} chunks in FAISS vector database.")
         return len(documents)
+    
+    def _search_faiss(self, query_text: str, k: int = 8):
+        """Search FAISS index for relevant documents"""
+        if self.faiss_index is None:
+            return []
+        
+        query_embedding = get_openai_embedding(query_text)
+        query_vector = np.array([query_embedding]).astype('float32')
+        
+        # Search
+        if k > self.faiss_index.ntotal:
+            k = self.faiss_index.ntotal
+        
+        distances, indices = self.faiss_index.search(query_vector, k)
+        
+        results = []
+        for idx, distance in zip(indices[0], distances[0]):
+            if idx != -1:  # Valid index
+                raw_id = self.index_to_id.get(idx)
+                if raw_id:
+                    raw_data = self.raw_data_store.get(raw_id)
+                    if raw_data:
+                        results.append({
+                            'raw_id': raw_id,
+                            'content': raw_data['content'],
+                            'page': raw_data['page'],
+                            'distance': float(distance)
+                        })
+        
+        return results
 
     def _get_relevant_context_for_fields(self):
         """
-        Stage 3: Smart context retrieval optimized for CCG2 fields
+        Stage 3: Smart context retrieval optimized for CCG2 fields using FAISS
         """
-        print("\n🔍 Stage 3: Retrieving Relevant Context (RAG)...")
+        print("\n🔍 Stage 3: Retrieving Relevant Context (FAISS RAG)...")
         
         # Field-specific queries for better precision
         field_queries = {
@@ -318,40 +350,41 @@ class HealthcareContractExtractor:
         }
         
         all_context = []
+        seen_raw_ids = set()
         
         for category, query in field_queries.items():
             try:
-                results = self.collection.query(
-                    query_texts=[query],
-                    n_results=8,  # Reduced for speed
-                )
+                results = self._search_faiss(query, k=8)
                 
-                if results['metadatas'] and results['metadatas'][0]:
-                    for metadata in results['metadatas'][0]:
-                        raw_id = metadata.get('raw_data_id')
-                        if raw_id and raw_id not in [c.get('raw_id') for c in all_context]:
-                            raw_data = self.raw_data_store.get(raw_id)
-                            if raw_data:
-                                all_context.append({
-                                    'raw_id': raw_id,
-                                    'content': raw_data['content'],
-                                    'page': raw_data['page'],
-                                    'category': category
-                                })
+                for result in results:
+                    raw_id = result['raw_id']
+                    if raw_id not in seen_raw_ids:
+                        all_context.append({
+                            'raw_id': raw_id,
+                            'content': result['content'],
+                            'page': result['page'],
+                            'category': category,
+                            'distance': result['distance']
+                        })
+                        seen_raw_ids.add(raw_id)
             except Exception as e:
-                print(f"⚠️  Query failed for {category}: {e}")
+                print(f"⚠️  FAISS search failed for {category}: {e}")
                 continue
         
         # Fallback with diverse content
         if not all_context and self.raw_data_store:
-            print("⚠️  Semantic search limited, using diverse content...")
+            print("⚠️  FAISS search limited, using diverse content...")
             for raw_id, data in list(self.raw_data_store.items())[:15]:
                 all_context.append({
                     'raw_id': raw_id,
                     'content': data['content'],
                     'page': data['page'],
-                    'category': 'general'
+                    'category': 'general',
+                    'distance': 0.0
                 })
+        
+        # Sort by distance (lower is better)
+        all_context.sort(key=lambda x: x['distance'])
         
         print(f"✅ Retrieved {len(all_context)} relevant context blocks.")
         return all_context
@@ -380,9 +413,9 @@ class HealthcareContractExtractor:
 
     def extract_fields_with_text_rag(self, context_blocks):
         """
-        Stage 4a: Primary text extraction for all CCG2 fields
+        Stage 4a: Primary text extraction for all CCG2 fields using OpenAI
         """
-        print("\n🤖 Stage 4a: Text-Only Extraction (RAG)...")
+        print("\n🤖 Stage 4a: Text-Only Extraction (OpenAI + FAISS RAG)...")
         
         context_string = self._format_context_for_llm(context_blocks)
         
@@ -405,15 +438,16 @@ OUTPUT JSON with all {len(ALL_FIELD_NAMES)} fields:"""
 
         try:
             start_time = time.time()
-            response = OLLAMA_CLIENT.chat(
+            response = OPENAI_CLIENT.chat.completions.create(
                 model=TEXT_LLM_MODEL,
                 messages=[{"role": "user", "content": extraction_prompt}],
-                format="json",
-                options={"temperature": 0.1, "num_predict": 4000}
+                response_format={"type": "json_object"},
+                temperature=0.1,
+                max_tokens=4000
             )
             extraction_time = time.time() - start_time
             
-            extracted_data = json.loads(response['message']['content'])
+            extracted_data = json.loads(response.choices[0].message.content)
             
             # Calculate confidence scores
             for field in ALL_FIELD_NAMES:
@@ -422,11 +456,11 @@ OUTPUT JSON with all {len(ALL_FIELD_NAMES)} fields:"""
                 self.extraction_results["confidence_scores"][field] = calculate_confidence(field, value)
                 self.extraction_results["extraction_method"][field] = "text"
             
-            print(f"✅ Text extraction completed in {extraction_time:.2f}s")
+            print(f"✅ OpenAI text extraction completed in {extraction_time:.2f}s")
             return True
             
         except Exception as e:
-            print(f"❌ Text extraction failed: {e}")
+            print(f"❌ OpenAI text extraction failed: {e}")
             # Initialize all fields as failed
             for field in ALL_FIELD_NAMES:
                 self.extraction_results["fields"][field] = "TEXT_EXTRACTION_FAILED"
@@ -447,18 +481,18 @@ OUTPUT JSON with all {len(ALL_FIELD_NAMES)} fields:"""
 
     def extract_fields_with_multimodal(self, field_names):
         """
-        Stage 4b: Multimodal fallback for low-confidence fields
+        Stage 4b: Multimodal fallback for low-confidence fields using GPT-4o Vision
         """
         if not field_names:
             return 0
             
-        print(f"\n🖼️  Stage 4b: Multimodal Fallback for {len(field_names)} fields...")
+        print(f"\n🖼️  Stage 4b: Multimodal Fallback with GPT-4o for {len(field_names)} fields...")
         
         corrections = 0
         
         # Process fields in batches for speed
         for i, field_name in enumerate(field_names[:10]):  # Limit to 10 fields for performance
-            print(f"  🔍 Processing {field_name} with multimodal...")
+            print(f"  🔍 Processing {field_name} with GPT-4o Vision...")
             
             # Find relevant pages for this field
             relevant_pages = self._find_relevant_pages_for_field(field_name)
@@ -467,7 +501,7 @@ OUTPUT JSON with all {len(ALL_FIELD_NAMES)} fields:"""
                 continue
             
             # Try to extract from images on relevant pages
-            field_value = self._extract_from_page_images(field_name, relevant_pages)
+            field_value = self._extract_from_page_images_gpt4o(field_name, relevant_pages)
             
             if field_value and field_value != "NOT_FOUND" and field_value != "N/A":
                 self.extraction_results["fields"][field_name] = field_value
@@ -498,8 +532,8 @@ OUTPUT JSON with all {len(ALL_FIELD_NAMES)} fields:"""
         
         return list(relevant_pages)
 
-    def _extract_from_page_images(self, field_name, page_numbers):
-        """Extract field value from page images using LLaVA"""
+    def _extract_from_page_images_gpt4o(self, field_name, page_numbers):
+        """Extract field value from page images using GPT-4o Vision"""
         for page_num in page_numbers[:2]:  # Check first 2 relevant pages
             page_images = self.all_extracted_images.get(page_num, [])
             
@@ -508,8 +542,8 @@ OUTPUT JSON with all {len(ALL_FIELD_NAMES)} fields:"""
                 if not image_base64:
                     continue
                 
-                # Optimized prompt for LLaVA
-                llava_prompt = f"""Analyze this healthcare contract page image.
+                # Optimized prompt for GPT-4o Vision
+                vision_prompt = f"""Analyze this healthcare contract page image.
 
 SPECIFIC FIELD TO FIND: {field_name}
 
@@ -523,19 +557,32 @@ Return ONLY the value if found, otherwise "NOT_FOUND".
 Be precise and concise."""
 
                 try:
-                    response = OLLAMA_CLIENT.generate(
+                    response = OPENAI_CLIENT.chat.completions.create(
                         model=MULTIMODAL_MODEL,
-                        prompt=llava_prompt,
-                        images=[image_base64],
-                        options={"temperature": 0.1, "num_predict": 500}
+                        messages=[
+                            {
+                                "role": "user",
+                                "content": [
+                                    {"type": "text", "text": vision_prompt},
+                                    {
+                                        "type": "image_url",
+                                        "image_url": {
+                                            "url": f"data:image/jpeg;base64,{image_base64}"
+                                        }
+                                    }
+                                ]
+                            }
+                        ],
+                        max_tokens=500,
+                        temperature=0.1
                     )
                     
-                    result = response['response'].strip()
+                    result = response.choices[0].message.content.strip()
                     if result and result != "NOT_FOUND" and len(result) > 1:
                         return result
                         
                 except Exception as e:
-                    print(f"    ⚠️  LLaVA error: {e}")
+                    print(f"    ⚠️  GPT-4o Vision error: {e}")
                     continue
         
         return None
@@ -548,6 +595,9 @@ Be precise and concise."""
         print("="*60)
         print(f"🎯 Target Fields: {len(ALL_FIELD_NAMES)} CCG2.0 fields")
         print(f"📄 Document: {self.file_path}")
+        print(f"🤖 Text Model: {TEXT_LLM_MODEL}")
+        print(f"🖼️  Vision Model: {MULTIMODAL_MODEL}")
+        print(f"🔤 Embedding Model: {EMBEDDING_MODEL}")
         print("="*60)
         
         start_total_time = time.time()
@@ -596,7 +646,12 @@ Be precise and concise."""
                 "multimodal_corrections": self.extraction_results["multimodal_corrections"],
                 "total_time_seconds": round(total_time, 2),
                 "is_scanned_pdf": self.is_scanned_pdf,
-                "extraction_timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+                "extraction_timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "models_used": {
+                    "text": TEXT_LLM_MODEL,
+                    "vision": MULTIMODAL_MODEL,
+                    "embedding": EMBEDDING_MODEL
+                }
             },
             "extracted_fields": [
                 {
@@ -643,21 +698,25 @@ Be precise and concise."""
                 for field in ALL_FIELD_NAMES
             ]
         }
-# --- Main Execution ---
-if __name__ == "__main__":
-    file_path = "sample-humana1.pdf"
-    
+
+
+# --- Main Execution for Databricks ---
+def run_extraction_on_databricks(file_path):
+    """
+    Main function to run extraction in Databricks environment
+    """
     if not os.path.exists(file_path):
         print(f"❌ File not found: {file_path}")
-        print("Please ensure the PDF file exists in the current directory.")
-        exit(1)
+        print("Please ensure the PDF file exists in the Databricks file system.")
+        return None
     
     print("🚀 CCG2.0 HEALTHCARE CONTRACT EXTRACTION SYSTEM")
     print("="*60)
     print(f"📄 Document: {file_path}")
     print(f"🎯 Target Fields: {len(ALL_FIELD_NAMES)} CCG2.0 fields")
     print(f"🤖 Text Model: {TEXT_LLM_MODEL}")
-    print(f"🖼️  Multimodal Model: {MULTIMODAL_MODEL}")
+    print(f"🖼️  Vision Model: {MULTIMODAL_MODEL}")
+    print(f"🔤 Embedding Model: {EMBEDDING_MODEL}")
     print("="*60)
     
     start_total_time = time.time()
@@ -681,49 +740,60 @@ if __name__ == "__main__":
     print(f"🔍 Scanned PDF: {summary['is_scanned_pdf']}")
     print("="*80)
     
-    # Save results
-    output_file = "ccg2_contract_extraction.json"
+    # Save results to Databricks File System (DBFS)
+    output_file = "/dbfs/tmp/ccg2_contract_extraction.json"
     with open(output_file, 'w', encoding='utf-8') as f:
         json.dump(final_results, f, indent=2, ensure_ascii=False)
     
     print(f"💾 Results saved to: {output_file}")
     
-    # Preview extracted fields by category
-    print(f"\n🔍 EXTRACTED FIELDS BY CATEGORY:")
-    print("-" * 70)
+    # Return results for further processing
+    return final_results
+
+
+if __name__ == "__main__":
+    # Example usage in Databricks
+    file_path = "/dbfs/tmp/sample-humana1.pdf"  # Adjust path for your Databricks setup
     
-    successful_fields = [
-        field for field in final_results["extracted_fields"] 
-        if field['value'] not in ['N/A', 'TEXT_EXTRACTION_FAILED', 'EXTRACTION_FAILED'] 
-        and len(field['value'].strip()) > 1
-    ]
+    # Set OpenAI API key from Databricks secrets
+    import os
+    from databricks import secrets
     
-    # Group by category
-    by_category = {}
-    for field in successful_fields:
-        category = field['field_category']
-        if category not in by_category:
-            by_category[category] = []
-        by_category[category].append(field)
+    # Get OpenAI API key from Databricks secrets
+    try:
+        OPENAI_API_KEY = secrets.get(scope="openai", key="api_key")
+        os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
+    except:
+        print("⚠️  Could not get OpenAI API key from secrets. Using environment variable.")
     
-    for category, fields in by_category.items():
-        print(f"\n📁 {category.replace('_', ' ').title()}:")
-        for field in fields[:5]:  # Show first 5 per category
-            value_preview = field['value'][:50] + "..." if len(field['value']) > 50 else field['value']
-            confidence = field['confidence_score']
-            method = field['extraction_method']
-            print(f"   • {field['attribute_name']:25} : {value_preview} (conf: {confidence:.1f}, {method})")
+    results = run_extraction_on_databricks(file_path)
+    
+    if results:
+        # Preview extracted fields by category
+        print(f"\n🔍 EXTRACTED FIELDS BY CATEGORY:")
+        print("-" * 70)
         
-        if len(fields) > 5:
-            print(f"   ... and {len(fields) - 5} more fields")
-    
-    # Show low confidence fields
-    low_confidence_fields = [
-        field for field in final_results["extracted_fields"]
-        if field['confidence_score'] < 0.5 and field['value'] not in ['N/A', 'EXTRACTION_FAILED']
-    ]
-    
-    if low_confidence_fields:
-        print(f"\n⚠️  LOW CONFIDENCE FIELDS ({len(low_confidence_fields)}):")
-        for field in low_confidence_fields[:10]:
-            print(f"   • {field['attribute_name']}: {field['value'][:30]}... (conf: {field['confidence_score']:.2f})")
+        successful_fields = [
+            field for field in results["extracted_fields"] 
+            if field['value'] not in ['N/A', 'TEXT_EXTRACTION_FAILED', 'EXTRACTION_FAILED'] 
+            and len(field['value'].strip()) > 1
+        ]
+        
+        # Group by category
+        by_category = {}
+        for field in successful_fields:
+            category = field['field_category']
+            if category not in by_category:
+                by_category[category] = []
+            by_category[category].append(field)
+        
+        for category, fields in by_category.items():
+            print(f"\n📁 {category.replace('_', ' ').title()}:")
+            for field in fields[:5]:  # Show first 5 per category
+                value_preview = field['value'][:50] + "..." if len(field['value']) > 50 else field['value']
+                confidence = field['confidence_score']
+                method = field['extraction_method']
+                print(f"   • {field['attribute_name']:25} : {value_preview} (conf: {confidence:.1f}, {method})")
+            
+            if len(fields) > 5:
+                print(f"   ... and {len(fields) - 5} more fields")
